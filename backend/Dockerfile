@@ -1,20 +1,20 @@
-# Start with a modern Node.js image
+# Start with a Node.js 20 image (LTS version is more stable for deployment)
 FROM node:20-slim
 
-# Install system dependencies for ffmpeg and yt-dlp
+# Install system dependencies needed for ffmpeg and yt-dlp
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     python3 \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp globally using pip
-RUN pip3 install yt-dlp
+# Install yt-dlp using pip with the flag to override the environment protection
+RUN pip3 install yt-dlp --break-system-packages
 
 # Set the working directory in the container
 WORKDIR /usr/src/app
 
-# Copy package files and install Node.js dependencies
+# Copy package files and install dependencies
 COPY package*.json ./
 RUN npm install --production
 
