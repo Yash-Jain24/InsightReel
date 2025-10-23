@@ -159,7 +159,24 @@ const importFromYouTube = async (req, res) => {
         console.log(`⚠️ Falling back to Picovoice for "${videoTitle}"`);
         const tempAudioTemplate = path.join(tempDir, `${Date.now()}-${videoId}`);
         console.log(`🎥 Downloading audio stream using yt-dlp...`);
-        await ytDlpWrap.execPromise([youtubeUrl, '-x', '--audio-format', 'm4a', '--referer', 'https://www.youtube.com/', '-o', `${tempAudioTemplate}.%(ext)s`]);
+        await ytDlpWrap.execPromise([
+            youtubeUrl,
+            '-x',
+            '--audio-format', 'm4a',
+            '--referer', 'https://www.youtube.com/',
+            '--cookies', '/etc/secrets/cookies.txt', // Path where Render mounts secret files
+            '-o', `${tempAudioTemplate}.%(ext)s`
+        ]);
+
+        console.log(`Attempting to download subtitles with yt-dlp...`);
+        await ytDlpWrap.execPromise([
+            youtubeUrl,
+            '--write-auto-sub',
+            '--sub-lang', 'en',
+            '--skip-download',
+            '--cookies', '/etc/secrets/cookies.txt', // Add cookies here too
+            '-o', tempSubTemplate
+        ]);
         
         const fileBaseName = path.basename(tempAudioTemplate);
         const downloadedFile = fs.readdirSync(tempDir).find(f => f.startsWith(fileBaseName));
