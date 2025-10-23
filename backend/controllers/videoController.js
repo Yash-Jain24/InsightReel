@@ -21,17 +21,18 @@ const s3 = new S3Client({
     credentials: { accessKeyId: process.env.B2_KEY_ID, secretAccessKey: process.env.B2_APP_KEY }
 });
 
-// Helper function to parse VTT subtitle files (with corrections)
+// Helper functions (parseVtt, vttTimestampToSeconds)
 const vttTimestampToSeconds = (timestamp) => {
-    const parts = timestamp.split(':');
-    const secondsParts = parts[2].split('.');
-    return parseInt(parts[0], 10) * 3600 + parseInt(parts[1], 10) * 60 + parseInt(secondsParts[0], 10) + parseInt(secondsParts[1], 10) / 1000;
+    try {
+        const parts = timestamp.split(':');
+        const secondsParts = parts[2].split('.');
+        return parseInt(parts[0], 10) * 3600 + parseInt(parts[1], 10) * 60 + parseInt(secondsParts[0], 10) + parseInt(secondsParts[1], 10) / 1000;
+    } catch { return 0; }
 };
 const parseVtt = (vttContent) => {
     const lines = vttContent.replace(/\r/g, '').split('\n');
     let fullTranscript = '';
     const transcriptWords = [];
-
     for (let i = 0; i < lines.length; i++) {
         if (lines[i].includes('-->')) {
             try {
@@ -40,16 +41,13 @@ const parseVtt = (vttContent) => {
                     const startTime = vttTimestampToSeconds(timeParts[0]);
                     const endTime = vttTimestampToSeconds(timeParts[1]);
                     let textLine = lines[i + 1] ? lines[i + 1].replace(/<[^>]+>/g, '').trim() : '';
-
-                    if (textLine) {
+                    if (textLine && !textLine.match(/^\d+$/)) {
                         fullTranscript += textLine + ' ';
                         const words = textLine.split(' ').filter(w => w);
                         const duration = endTime - startTime;
                         const durationPerWord = words.length > 0 ? duration / words.length : 0;
                         words.forEach((word, index) => {
-                            transcriptWords.push({
-                                word: word, start: startTime + (index * durationPerWord), end: startTime + ((index + 1) * durationPerWord),
-                            });
+                            transcriptWords.push({ word: word, start: startTime + (index * durationPerWord), end: startTime + ((index + 1) * durationPerWord) });
                         });
                     }
                 }
@@ -78,7 +76,9 @@ const uploadVideo = (req, res) => {
             const finalVideo = await processVideo(newVideo._id, req.user.id);
             res.status(201).json(finalVideo);
         } catch (err) {
-            res.status(500).send('Server Error');
+            console.error(`Upload controller error: ${err.message}`);
+            // Send back the specific error message if available
+            res.status(500).json({ msg: err.message || 'Server Error during upload processing' });
         }
     });
 };
@@ -91,6 +91,7 @@ const getUserVideos = async (req, res) => {
         const videos = await Video.find(query).sort({ createdAt: -1 });
         res.json(videos);
     } catch (err) {
+        console.error(err.message);
         res.status(500).send('Server Error');
     }
 };
@@ -104,6 +105,7 @@ const getVideoById = async (req, res) => {
         if (!video) return res.status(404).json({ msg: 'Video not found or access denied' });
         res.json(video);
     } catch (err) {
+        console.error(err.message);
         res.status(500).send('Server Error');
     }
 };
@@ -124,7 +126,9 @@ const importFromYouTube = async (req, res) => {
     let videoTitle = title;
     const tempDir = path.join(__dirname, '..', 'uploads');
     fs.mkdirSync(tempDir, { recursive: true });
-    
+    let tempSubtitlePath = null;
+    let tempAudioPath = null; // Track audio path for potential processVideo call
+
     try {
         console.log(`Fetching video details for ID: ${videoId} via YouTube Data API.`);
         const videoDetailsResponse = await youtube.videos.list({ part: 'snippet,contentDetails', id: videoId });
@@ -133,11 +137,10 @@ const importFromYouTube = async (req, res) => {
         videoTitle = title || videoItem.snippet.title;
 
         if (videoItem.contentDetails.caption === 'true') {
-            let tempSubtitlePath = null;
             try {
                 const tempSubTemplate = path.join(tempDir, `${Date.now()}-${videoId}`);
                 console.log(`Attempting to download subtitles with yt-dlp...`);
-                await ytDlpWrap.execPromise([youtubeUrl, '--write-auto-sub', '--sub-lang', 'en', '--skip-download', '-o', tempSubTemplate]);
+                await ytDlpWrap.execPromise([youtubeUrl, '--write-auto-sub', '--sub-lang', 'en', '--sub-format', 'vtt', '--skip-download', '-o', tempSubTemplate]);
                 tempSubtitlePath = `${tempSubTemplate}.en.vtt`;
 
                 if (fs.existsSync(tempSubtitlePath)) {
@@ -148,10 +151,13 @@ const importFromYouTube = async (req, res) => {
                     const newVideo = new Video({ title: videoTitle, originalFilename: youtubeUrl, status: 'completed', owner: req.user.id, fullTranscript, transcriptWords, storagePath: youtubeUrl });
                     await newVideo.save();
                     return res.status(201).json(newVideo);
+                } else {
+                    throw new Error("yt-dlp completed but subtitle file not found.");
                 }
             } catch (subError) {
                 console.warn(`Could not download subtitles with yt-dlp. Falling back. Error: ${subError.message}`);
                 if (tempSubtitlePath && fs.existsSync(tempSubtitlePath)) fs.unlinkSync(tempSubtitlePath);
+                // Proceed to fallback
             }
         }
         
@@ -159,41 +165,44 @@ const importFromYouTube = async (req, res) => {
         console.log(`⚠️ Falling back to Picovoice for "${videoTitle}"`);
         const tempAudioTemplate = path.join(tempDir, `${Date.now()}-${videoId}`);
         console.log(`🎥 Downloading audio stream using yt-dlp...`);
-        await ytDlpWrap.execPromise([
-            youtubeUrl,
-            '-x',
-            '--audio-format', 'm4a',
-            '--referer', 'https://www.youtube.com/',
-            '--cookies', '/etc/secrets/cookies.txt', // Path where Render mounts secret files
-            '-o', `${tempAudioTemplate}.%(ext)s`
-        ]);
-
-        console.log(`Attempting to download subtitles with yt-dlp...`);
-        await ytDlpWrap.execPromise([
-            youtubeUrl,
-            '--write-auto-sub',
-            '--sub-lang', 'en',
-            '--skip-download',
-            '--cookies', '/etc/secrets/cookies.txt', // Add cookies here too
-            '-o', tempSubTemplate
-        ]);
+        try {
+             await ytDlpWrap.execPromise([
+                youtubeUrl, '-x', '--audio-format', 'm4a',
+                '--referer', 'https://www.youtube.com/',
+                '--no-check-certificate', // Keep these flags as they might help
+                '--rm-cache-dir',
+                '-o', `${tempAudioTemplate}.%(ext)s`
+            ]);
+        } catch (downloadError) {
+            console.error(`yt-dlp audio download failed: ${downloadError.message}`);
+            // **USER-FRIENDLY ERROR for YT Block**
+            return res.status(403).json({ msg: "YouTube blocked the request to download audio for this video." });
+        }
         
         const fileBaseName = path.basename(tempAudioTemplate);
         const downloadedFile = fs.readdirSync(tempDir).find(f => f.startsWith(fileBaseName));
-        if (!downloadedFile) throw new Error('Failed to find downloaded audio file.');
+        if (!downloadedFile) throw new Error('Failed to find downloaded audio file after yt-dlp success.');
         
-        const finalAudioPath = path.join(tempDir, downloadedFile);
-        console.log(`🎧 Audio downloaded to ${finalAudioPath}.`);
+        tempAudioPath = path.join(tempDir, downloadedFile); // Assign to tempAudioPath
+        console.log(`🎧 Audio downloaded to ${tempAudioPath}.`);
         
-        const newVideo = new Video({ title: videoTitle, originalFilename: youtubeUrl, storagePath: youtubeUrl, owner: req.user.id, audioPath: finalAudioPath, status: 'processing' });
+        const newVideo = new Video({ title: videoTitle, originalFilename: youtubeUrl, storagePath: youtubeUrl, owner: req.user.id, audioPath: tempAudioPath, status: 'processing' });
         await newVideo.save();
 
-        const finalVideo = await processVideo(newVideo._id, req.user.id, finalAudioPath);
+        // Pass the downloaded audio path to processVideo
+        const finalVideo = await processVideo(newVideo._id, req.user.id, tempAudioPath);
+        // Check if processVideo itself failed and set a user-friendly message
+        if (finalVideo.status === 'failed' && finalVideo.fullTranscript.startsWith('Leopard failed')) {
+            return res.status(500).json({ msg: "Transcription engine couldn't process the audio from this YouTube video." });
+        }
         return res.status(201).json(finalVideo);
 
     } catch (procError) {
         console.error(`Error in YouTube import process: ${procError.message}`);
+        // Generic fallback error
         return res.status(500).json({ msg: `Failed to process YouTube video: ${procError.message}` });
+    } finally {
+         // Cleanup handled within processVideo now
     }
 };
 
@@ -209,6 +218,7 @@ const getPlayUrl = async (req, res) => {
         const signedUrl = await getSignedUrl(s3, command, { expiresIn: 3600 });
         res.json({ url: signedUrl });
     } catch (err) {
+        console.error(err.message);
         res.status(500).send('Server Error');
     }
 };
@@ -227,6 +237,7 @@ const deleteVideo = async (req, res) => {
         await Video.findByIdAndDelete(req.params.id);
         res.json({ msg: 'Video deleted successfully' });
     } catch (err) {
+        console.error(err.message);
         res.status(500).send('Server Error');
     }
 };
@@ -235,6 +246,8 @@ const extractAudio = (inputPath, outputPath) => {
     return new Promise((resolve, reject) => {
         if (!fs.existsSync(inputPath)) return reject(new Error(`Input file not found for FFmpeg: ${inputPath}`));
         ffmpeg(inputPath).output(outputPath).audioChannels(1).audioFrequency(16000)
+             .noVideo()
+             .audioCodec('pcm_s16le')
             .on('end', () => resolve(outputPath)).on('error', (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
             .run();
     });
@@ -246,6 +259,7 @@ const processVideo = async (videoId, userId, existingAudioPath = null) => {
     
     const tempLocalPaths = [];
     try {
+        // Kill switch checks...
         const globalSettings = await AppSettings.findOne({ key: 'globalTranscriptionStatus' });
         if (globalSettings && !globalSettings.isEnabled) {
             video.status = 'disabled'; video.fullTranscript = 'Transcription service is globally disabled.';
@@ -259,13 +273,13 @@ const processVideo = async (videoId, userId, existingAudioPath = null) => {
         }
 
         let audioToConvert = existingAudioPath;
-        if (existingAudioPath) tempLocalPaths.push(existingAudioPath);
+        if (existingAudioPath) tempLocalPaths.push(existingAudioPath); // Track YT download
 
         if (!audioToConvert) { // B2 upload
             const tempDir = path.join(__dirname, '..', 'uploads');
             fs.mkdirSync(tempDir, { recursive: true });
             const tempDownloadPath = path.join(tempDir, path.basename(video.storagePath));
-            tempLocalPaths.push(tempDownloadPath);
+            tempLocalPaths.push(tempDownloadPath); // Track B2 download
             console.log(`⬇️ Downloading ${video.storagePath} from B2 to process...`);
             const command = new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: video.storagePath });
             const { Body } = await s3.send(command);
@@ -276,14 +290,24 @@ const processVideo = async (videoId, userId, existingAudioPath = null) => {
         }
 
         const createdWavPath = path.join(path.dirname(audioToConvert), `${path.basename(audioToConvert, path.extname(audioToConvert))}.wav`);
-        tempLocalPaths.push(createdWavPath);
+        tempLocalPaths.push(createdWavPath); // Track WAV file
         console.log(`🔄 Converting audio to WAV for Picovoice...`);
         await extractAudio(audioToConvert, createdWavPath);
 
         console.log(`🎤 Leopard: Transcribing...`);
-        const leopard = new Leopard(process.env.PICOVOICE_ACCESS_KEY);
-        const { transcript, words } = leopard.processFile(createdWavPath);
-        leopard.release();
+        let transcript = '';
+        let words = [];
+        try {
+            const leopard = new Leopard(process.env.PICOVOICE_ACCESS_KEY);
+            const result = leopard.processFile(createdWavPath);
+            transcript = result.transcript;
+            words = result.words;
+            leopard.release();
+        } catch (leopardError) {
+             console.error(`Picovoice Leopard failed: ${leopardError.message}`);
+             // **USER-FRIENDLY ERROR for Picovoice Failure**
+             throw new Error("Transcription engine couldn't extract audio successfully.");
+        }
 
         video.status = 'completed';
         video.fullTranscript = transcript;
@@ -293,12 +317,19 @@ const processVideo = async (videoId, userId, existingAudioPath = null) => {
     } catch (error) {
         console.error(`❌ Failed to process video ${videoId}:`, error.message);
         video.status = 'failed';
-        video.fullTranscript = error.message || 'Processing failed.';
+        // Set user-friendly message based on error, otherwise keep technical one
+        if (error.message.includes("YouTube blocked")) {
+             video.fullTranscript = "YouTube blocked the request to fetch this video.";
+        } else if (error.message.includes("Transcription engine couldn't")) {
+            video.fullTranscript = "Transcription engine couldn't extract audio successfully.";
+        } else {
+            video.fullTranscript = error.message || 'Processing failed.'; // Default technical error
+        }
         return await video.save();
     } finally {
         tempLocalPaths.forEach(filePath => {
             if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-});
+        });
     }
 };
 

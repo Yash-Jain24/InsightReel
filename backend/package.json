@@ -26,6 +26,8 @@
     "mongoose": "^8.19.1",
     "multer": "^2.0.2",
     "multer-s3": "^3.0.1",
-    "yt-dlp-wrap": "^2.3.12"
+    "youtube-transcript": "^1.2.1",
+    "yt-dlp-wrap": "^2.3.12",
+    "ytdl-core": "^4.11.5"
   }
 }
